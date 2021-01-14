@@ -65,11 +65,13 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
       // so it's blocked over wifi
       switch (setup->b.wValue.w) {
         case 0:
-          #ifdef ALLOW_DEBUG
+          // TODO: put this back when it's no longer a "devkit"
+          //#ifdef ALLOW_DEBUG
+          #if 1
           if (hardwired) {
           #else
-          // no more bootstub on UNO
-          if (hardwired && hw_type != HW_TYPE_UNO) {
+          // no more bootstub on UNO once OTP block is flashed
+          if (hardwired && ((hw_type != HW_TYPE_UNO) || (!is_provisioned()))) {
           #endif
             puts("-> entering bootloader\n");
             enter_bootloader_mode = ENTER_BOOTLOADER_MAGIC;
@@ -108,6 +110,7 @@ void usb_cb_ep3_out(void *usbdata, int len, bool hardwired) {
   UNUSED(len);
   UNUSED(hardwired);
 }
+void usb_cb_ep3_out_complete(void) {}
 
 int is_enumerated = 0;
 void usb_cb_enumeration_complete(void) {
@@ -287,7 +290,7 @@ void soft_flasher_start(void) {
   // B8,B9: CAN 1
   set_gpio_alternate(GPIOB, 8, GPIO_AF9_CAN1);
   set_gpio_alternate(GPIOB, 9, GPIO_AF9_CAN1);
-  current_board->enable_can_transciever(1, true);
+  current_board->enable_can_transceiver(1, true);
 
   // init can
   llcan_set_speed(CAN1, 5000, false, false);

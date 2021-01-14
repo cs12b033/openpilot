@@ -15,6 +15,18 @@ void sig_handler(int signal) {
   msgq_do_exit = 1;
 }
 
+static size_t get_size(std::string endpoint){
+  size_t sz = DEFAULT_SEGMENT_SIZE;
+
+#if !defined(QCOM) && !defined(QCOM2)
+  if (endpoint == "frame" || endpoint == "frontFrame" || endpoint == "wideFrame"){
+    sz *= 10;
+  }
+#endif
+
+  return sz;
+}
+
 
 MSGQContext::MSGQContext() {
 }
@@ -49,13 +61,12 @@ MSGQMessage::~MSGQMessage() {
   this->close();
 }
 
-
 int MSGQSubSocket::connect(Context *context, std::string endpoint, std::string address, bool conflate){
   assert(context);
   assert(address == "127.0.0.1");
 
   q = new msgq_queue_t;
-  int r = msgq_new_queue(q, endpoint.c_str(), DEFAULT_SEGMENT_SIZE);
+  int r = msgq_new_queue(q, endpoint.c_str(), get_size(endpoint));
   if (r != 0){
     return r;
   }
@@ -85,7 +96,6 @@ Message * MSGQSubSocket::receive(bool non_blocking){
   msgq_msg_t msg;
 
   MSGQMessage *r = NULL;
-  r = NULL;
 
   int rc = msgq_msg_recv(&msg, q);
 
@@ -109,15 +119,21 @@ Message * MSGQSubSocket::receive(bool non_blocking){
     }
   }
 
-  if (rc > 0){
-    r = new MSGQMessage;
-    r->takeOwnership(msg.data, msg.size);
-  }
-  errno = msgq_do_exit ? EINTR : 0;
 
   if (!non_blocking){
     std::signal(SIGINT, prev_handler_sigint);
     std::signal(SIGTERM, prev_handler_sigterm);
+  }
+
+  errno = msgq_do_exit ? EINTR : 0;
+
+  if (rc > 0){
+    if (msgq_do_exit){
+      msgq_msg_close(&msg); // Free unused message on exit
+    } else {
+      r = new MSGQMessage;
+      r->takeOwnership(msg.data, msg.size);
+    }
   }
 
   return (Message*)r;
@@ -138,7 +154,11 @@ int MSGQPubSocket::connect(Context *context, std::string endpoint){
   assert(context);
 
   q = new msgq_queue_t;
-  msgq_new_queue(q, endpoint.c_str(), DEFAULT_SEGMENT_SIZE);
+  int r = msgq_new_queue(q, endpoint.c_str(), get_size(endpoint));
+  if (r != 0){
+    return r;
+  }
+
   msgq_init_publisher(q);
 
   return 0;

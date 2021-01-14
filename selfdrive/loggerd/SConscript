@@ -1,6 +1,18 @@
-Import('env', 'messaging', 'common', 'visionipc')
-env.Program(['loggerd.cc', 'logger.c', 'raw_logger.cc', 'encoder.c'], LIBS=[
-  'zmq', 'czmq', 'capnp', 'kj', 'yaml-cpp', 'z',
+Import('env', 'arch', 'cereal', 'messaging', 'common', 'visionipc')
+
+src = ['loggerd.cc', 'logger.cc']
+libs = ['zmq', 'capnp', 'kj', 'z',
   'avformat', 'avcodec', 'swscale', 'avutil',
-  'OmxVenc', 'OmxCore', 'yuv',
-  'bz2', 'cutils', common, 'json', messaging, visionipc])
+  'yuv', 'bz2', common, cereal, messaging, visionipc]
+
+if arch in ["aarch64", "larch64"]:
+  src += ['encoder.c']
+  libs += ['OmxVenc', 'OmxCore']
+  if arch == "aarch64":
+    libs += ['cutils']
+  else:
+    libs += ['pthread']
+else:
+  libs += ['pthread']
+
+env.Program(src, LIBS=libs)

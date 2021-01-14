@@ -7,7 +7,6 @@
 #include <sys/time.h>
 #include <sys/cdefs.h>
 #include <sys/types.h>
-#include <sys/timerfd.h>
 #include <sys/resource.h>
 
 #include <pthread.h>
@@ -17,25 +16,15 @@
 #include <hardware/gps.h>
 #include <utils/Timers.h>
 
-#include <capnp/serialize.h>
-
 #include "messaging.hpp"
 #include "common/timing.h"
 #include "common/swaglog.h"
-
-#include "cereal/gen/cpp/log.capnp.h"
-
-#include "rawgps.h"
 
 volatile sig_atomic_t do_exit = 0;
 
 namespace {
 
-pthread_t clock_thread_handle;
-
-Context *gps_context;
-PubSocket *gps_publisher;
-PubSocket *gps_location_publisher;
+PubMaster *pm;
 
 const GpsInterface* gGpsInterface = NULL;
 const AGpsInterface* gAGpsInterface = NULL;
@@ -46,33 +35,22 @@ void set_do_exit(int sig) {
 
 void nmea_callback(GpsUtcTime timestamp, const char* nmea, int length) {
 
-  uint64_t log_time = nanos_since_boot();
   uint64_t log_time_wall = nanos_since_epoch();
 
-  capnp::MallocMessageBuilder msg;
-  cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(log_time);
-
-  auto nmeaData = event.initGpsNMEA();
+  MessageBuilder msg;
+  auto nmeaData = msg.initEvent().initGpsNMEA();
   nmeaData.setTimestamp(timestamp);
   nmeaData.setLocalWallTime(log_time_wall);
   nmeaData.setNmea(nmea);
 
-  auto words = capnp::messageToFlatArray(msg);
-  auto bytes = words.asBytes();
-  // printf("gps send %d\n", bytes.size());
-  gps_publisher->send((char*)bytes.begin(), bytes.size());
+  pm->send("gpsNMEA", msg);
 }
 
 void location_callback(GpsLocation* location) {
   //printf("got location callback\n");
-  uint64_t log_time = nanos_since_boot();
 
-  capnp::MallocMessageBuilder msg;
-  cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(log_time);
-
-  auto locationData = event.initGpsLocation();
+  MessageBuilder msg;
+  auto locationData = msg.initEvent().initGpsLocation();
   locationData.setFlags(location->flags);
   locationData.setLatitude(location->latitude);
   locationData.setLongitude(location->longitude);
@@ -83,9 +61,7 @@ void location_callback(GpsLocation* location) {
   locationData.setTimestamp(location->timestamp);
   locationData.setSource(cereal::GpsLocationData::SensorSource::ANDROID);
 
-  auto words = capnp::messageToFlatArray(msg);
-  auto bytes = words.asBytes();
-  gps_location_publisher->send((char*)bytes.begin(), bytes.size());
+  pm->send("gpsLocation", msg);
 }
 
 pthread_t create_thread_callback(const char* name, void (*start)(void *), void* arg) {
@@ -130,9 +106,8 @@ AGpsCallbacks agps_callbacks = {
   create_thread_callback,
 };
 
-
-
 void gps_init() {
+  pm = new PubMaster({"gpsNMEA", "gpsLocation"});
   LOG("*** init GPS");
   hw_module_t* module = NULL;
   hw_get_module(GPS_HARDWARE_MODULE_ID, (hw_module_t const**)&module);
@@ -161,85 +136,17 @@ void gps_init() {
                                    GPS_POSITION_RECURRENCE_PERIODIC,
                                    100, 0, 0);
 
-  gps_context = Context::create();
-  gps_publisher = PubSocket::create(gps_context, "gpsNMEA");
-  gps_location_publisher = PubSocket::create(gps_context, "gpsLocation");
-
-  assert(gps_publisher != NULL);
-  assert(gps_location_publisher != NULL);
 }
 
 void gps_destroy() {
+  delete pm;
   gGpsInterface->stop();
   gGpsInterface->cleanup();
 }
 
-
-int64_t arm_cntpct() {
-  int64_t v;
-  asm volatile("mrs %0, cntpct_el0" : "=r"(v));
-  return v;
-}
-
-// TODO: move this out of here
-void* clock_thread(void* args) {
-  int err = 0;
-
-  PubSocket* clock_publisher = PubSocket::create(gps_context, "clocks");
-  assert(clock_publisher != NULL);
-
-  int timerfd = timerfd_create(CLOCK_BOOTTIME, 0);
-  assert(timerfd >= 0);
-
-  struct itimerspec spec = {0};
-  spec.it_interval.tv_sec = 1;
-  spec.it_interval.tv_nsec = 0;
-  spec.it_value.tv_sec = 1;
-  spec.it_value.tv_nsec = 0;
-
-  err = timerfd_settime(timerfd, 0, &spec, 0);
-  assert(err == 0);
-
-  uint64_t expirations = 0;
-  while ((err = read(timerfd, &expirations, sizeof(expirations)))) {
-    if (err < 0) break;
-
-    if (do_exit) break;
-
-    uint64_t boottime = nanos_since_boot();
-    uint64_t monotonic = nanos_monotonic();
-    uint64_t monotonic_raw = nanos_monotonic_raw();
-    uint64_t wall_time = nanos_since_epoch();
-
-    uint64_t modem_uptime_v = arm_cntpct() / 19200ULL; // 19.2 mhz clock
-
-    capnp::MallocMessageBuilder msg;
-    cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-    event.setLogMonoTime(boottime);
-    auto clocks = event.initClocks();
-
-    clocks.setBootTimeNanos(boottime);
-    clocks.setMonotonicNanos(monotonic);
-    clocks.setMonotonicRawNanos(monotonic_raw);
-    clocks.setWallTimeNanos(wall_time);
-    clocks.setModemUptimeMillis(modem_uptime_v);
-
-    auto words = capnp::messageToFlatArray(msg);
-    auto bytes = words.asBytes();
-    clock_publisher->send((char*)bytes.begin(), bytes.size());
-  }
-
-  close(timerfd);
-  delete clock_publisher;
-
-  return NULL;
-}
-
-
 }
 
 int main() {
-  int err = 0;
   setpriority(PRIO_PROCESS, 0, -13);
 
   signal(SIGINT, (sighandler_t)set_do_exit);
@@ -247,18 +154,7 @@ int main() {
 
   gps_init();
 
-  rawgps_init();
-
-  err = pthread_create(&clock_thread_handle, NULL,
-                       clock_thread, NULL);
-  assert(err == 0);
-
   while(!do_exit) pause();
-
-  err = pthread_join(clock_thread_handle, NULL);
-  assert(err == 0);
-
-  rawgps_destroy();
 
   gps_destroy();
 

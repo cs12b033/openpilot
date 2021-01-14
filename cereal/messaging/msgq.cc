@@ -21,17 +21,25 @@
 
 #include <stdio.h>
 
+#include "services.h"
+
 #include "msgq.hpp"
 
-void sigusr1_handler(int signal) {
-  assert(signal == SIGUSR1);
+void sigusr2_handler(int signal) {
+  assert(signal == SIGUSR2);
 }
 
 uint64_t msgq_get_uid(void){
   std::random_device rd("/dev/urandom");
   std::uniform_int_distribution<uint64_t> distribution(0,std::numeric_limits<uint32_t>::max());
 
-  uint64_t uid = distribution(rd) << 32 | syscall(SYS_gettid);
+  #ifdef __APPLE__
+    // TODO: this doesn't work
+    uint64_t uid = distribution(rd) << 32 | getpid();
+  #else
+    uint64_t uid = distribution(rd) << 32 | syscall(SYS_gettid);
+  #endif
+
   return uid;
 }
 
@@ -75,12 +83,21 @@ void msgq_wait_for_subscriber(msgq_queue_t *q){
   return;
 }
 
-
+bool service_exists(std::string path){
+  for (const auto& it : services) {
+    if (it.name == path) {
+      return true;
+    }
+  }
+  return false;
+}
 
 int msgq_new_queue(msgq_queue_t * q, const char * path, size_t size){
   assert(size < 0xFFFFFFFF); // Buffer must be smaller than 2^32 bytes
-
-  std::signal(SIGUSR1, sigusr1_handler);
+  if (!service_exists(std::string(path))){
+    std::cout << "Warning, " << std::string(path) << " is not in service list." << std::endl;
+  }
+  std::signal(SIGUSR2, sigusr2_handler);
 
   const char * prefix = "/dev/shm/";
   char * full_path = new char[strlen(path) + strlen(prefix) + 1];
@@ -88,21 +105,24 @@ int msgq_new_queue(msgq_queue_t * q, const char * path, size_t size){
   strcat(full_path, path);
 
   auto fd = open(full_path, O_RDWR | O_CREAT, 0777);
+  if (fd < 0) {
+    std::cout << "Warning, could not open: " << full_path << std::endl;
+    delete[] full_path;
+    return -1;
+  }
   delete[] full_path;
 
-  if (fd < 0)
-    return -1;
-
   int rc = ftruncate(fd, size + sizeof(msgq_header_t));
-  if (rc < 0)
+  if (rc < 0){
+    close(fd);
     return -1;
-
+  }
   char * mem = (char*)mmap(NULL, size + sizeof(msgq_header_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
 
-  if (mem == NULL)
+  if (mem == NULL){
     return -1;
-
+  }
   q->mmap_p = mem;
 
   msgq_header_t *header = (msgq_header_t *)mem;
@@ -136,7 +156,7 @@ void msgq_close_queue(msgq_queue_t *q){
 
 
 void msgq_init_publisher(msgq_queue_t * q) {
-  std::cout << "Starting publisher" << std::endl;
+  //std::cout << "Starting publisher" << std::endl;
   uint64_t uid = msgq_get_uid();
 
   *q->write_uid = uid;
@@ -148,6 +168,15 @@ void msgq_init_publisher(msgq_queue_t * q) {
   }
 
   q->write_uid_local = uid;
+}
+
+static void thread_signal(uint32_t tid) {
+  #ifndef SYS_tkill
+    // TODO: this won't work for multithreaded programs
+    kill(tid, SIGUSR2);
+  #else
+    syscall(SYS_tkill, tid, SIGUSR2);
+  #endif
 }
 
 void msgq_init_subscriber(msgq_queue_t * q) {
@@ -173,7 +202,7 @@ void msgq_init_subscriber(msgq_queue_t * q) {
         *q->read_uids[i] = 0;
 
         // Wake up reader in case they are in a poll
-        syscall(SYS_tkill, old_uid & 0xFFFFFFFF, SIGUSR1);
+        thread_signal(old_uid & 0xFFFFFFFF);
       }
 
       continue;
@@ -196,7 +225,7 @@ void msgq_init_subscriber(msgq_queue_t * q) {
     }
   }
 
-  std::cout << "New subscriber id: " << q->reader_id << " uid: " << q->read_uid_local << " " << q->endpoint << std::endl;
+  //std::cout << "New subscriber id: " << q->reader_id << " uid: " << q->read_uid_local << " " << q->endpoint << std::endl;
   msgq_reset_reader(q);
 }
 
@@ -278,8 +307,7 @@ int msgq_msg_send(msgq_msg_t * msg, msgq_queue_t *q){
   // Notify readers
   for (uint64_t i = 0; i < num_readers; i++){
     uint64_t reader_uid = *q->read_uids[i];
-
-    syscall(SYS_tkill, reader_uid & 0xFFFFFFFF, SIGUSR1);
+    thread_signal(reader_uid & 0xFFFFFFFF);
   }
 
   return msg->size;
@@ -402,8 +430,6 @@ int msgq_msg_recv(msgq_msg_t * msg, msgq_queue_t * q){
 
 
 int msgq_poll(msgq_pollitem_t * items, size_t nitems, int timeout){
-  assert(timeout >= 0);
-
   int num = 0;
 
   // Check if messages ready

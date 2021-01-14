@@ -1,44 +1,59 @@
-#ifndef MODEL_H
-#define MODEL_H
+#pragma once
 
 // gate this here
 #define TEMPORAL
 #define DESIRE
-
-#ifdef DESIRE
-  #define DESIRE_SIZE 8
-#endif
+#define TRAFFIC_CONVENTION
 
 #include "common/mat.h"
-#include "common/modeldata.h"
 #include "common/util.h"
+#include "common/modeldata.h"
 
 #include "commonmodel.h"
 #include "runners/run.h"
 
-#include "cereal/gen/cpp/log.capnp.h"
-#include <czmq.h>
-#include <capnp/serialize.h>
+#include <memory>
 #include "messaging.hpp"
+
+constexpr int DESIRE_LEN = 8;
+constexpr int TRAFFIC_CONVENTION_LEN = 2;
+constexpr int MODEL_FREQ = 20;
+struct ModelDataRaw {
+    float *plan;
+    float *lane_lines;
+    float *lane_lines_prob;
+    float *road_edges;
+    float *lead;
+    float *lead_prob;
+    float *desire_state;
+    float *meta;
+    float *desire_pred;
+    float *pose;
+  };
 
 
 typedef struct ModelState {
-  ModelInput in;
-  float *output;
-  RunModel *m;
+  ModelFrame frame;
+  std::unique_ptr<float[]> output;
+  std::unique_ptr<float[]> input_frames;
+  std::unique_ptr<RunModel> m;
+  cl_command_queue q;
 #ifdef DESIRE
-  float *desire;
+  float prev_desire[DESIRE_LEN] = {};
+  float pulse_desire[DESIRE_LEN] = {};
+#endif
+#ifdef TRAFFIC_CONVENTION
+  float traffic_convention[TRAFFIC_CONVENTION_LEN] = {};
 #endif
 } ModelState;
 
-void model_init(ModelState* s, cl_device_id device_id,
-                cl_context context, int temporal);
-ModelData model_eval_frame(ModelState* s, cl_command_queue q,
-                           cl_mem yuv_cl, int width, int height,
-                           mat3 transform, void* sock, float *desire_in);
+void model_init(ModelState* s, cl_device_id device_id, cl_context context);
+ModelDataRaw model_eval_frame(ModelState* s, cl_mem yuv_cl, int width, int height,
+                           const mat3 &transform, float *desire_in);
 void model_free(ModelState* s);
 void poly_fit(float *in_pts, float *in_stds, float *out);
-
-void model_publish(PubSocket* sock, uint32_t frame_id,
-                   const ModelData data, uint64_t timestamp_eof);
-#endif
+void model_publish(PubMaster &pm, uint32_t vipc_frame_id, uint32_t frame_id, float frame_drop,
+                   const ModelDataRaw &net_outputs, const float *raw_pred, uint64_t timestamp_eof,
+                   float model_execution_time);
+void posenet_publish(PubMaster &pm, uint32_t vipc_frame_id, uint32_t vipc_dropped_frames,
+                     const ModelDataRaw &net_outputs, uint64_t timestamp_eof);
